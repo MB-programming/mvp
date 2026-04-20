@@ -165,11 +165,11 @@ function buildContext(int $projectId): string
     return $ctx;
 }
 
-// ─── Gemini API ───────────────────────────────────────────────────────────────
+// ─── AI Providers ─────────────────────────────────────────────────────────────
 
-function callGemini(string $projectName, string $ctx, array $history, string $userMsg): array
+function buildSystemPrompt(string $projectName, string $ctx): string
 {
-    $system = <<<PROMPT
+    return <<<PROMPT
 أنت مساعد برمجي خبير مدمج في محرر أكواد يُسمى "AI Code Editor".
 مهمتك مساعدة المستخدم في إنشاء وتعديل ملفات المشروع.
 
@@ -178,13 +178,13 @@ function callGemini(string $projectName, string $ctx, array $history, string $us
 ملفات المشروع الحالية:
 {$ctx}
 
-═══════════════════════════════════════════════
-تعليمات مهمة جداً - اتبعها دائماً:
-═══════════════════════════════════════════════
+════════════════════════════════════
+تعليمات إلزامية — اتبعها دائماً:
+════════════════════════════════════
 
-1. عند إنشاء أو تعديل ملفات، يجب أن يكون ردك JSON صحيحاً تماماً بهذا الشكل:
+عند إنشاء أو تعديل ملفات يجب أن يكون ردك JSON صحيحاً تماماً:
 {
-  "message": "شرح واضح لما فعلته",
+  "message": "شرح ما فعلته",
   "files": [
     {
       "action": "write",
@@ -194,27 +194,42 @@ function callGemini(string $projectName, string $ctx, array $history, string $us
   ]
 }
 
-2. لحذف ملف:
-{
-  "action": "delete",
-  "path": "الملف/المراد/حذفه.ext"
-}
+لحذف ملف: { "action": "delete", "path": "..." }
+بدون تغييرات: { "message": "إجابتك", "files": [] }
 
-3. إذا لم تكن هناك تغييرات على الملفات:
-{
-  "message": "إجابتك هنا",
-  "files": []
-}
-
-قواعد ثابتة:
-- المسارات نسبية لجذر المشروع (مثال: "index.php"، "css/style.css")
-- لا تستخدم "/" في بداية المسار ولا ".."
-- اكتب محتوى الملف كاملاً دائماً، ليس فقط التغييرات
-- ردك بالكامل يجب أن يكون JSON صالحاً - لا نص خارج JSON
+قواعد:
+- المسارات نسبية لجذر المشروع — لا تستخدم "/" في البداية ولا ".."
+- اكتب محتوى الملف كاملاً دائماً
+- ردك بالكامل يجب أن يكون JSON صالحاً فقط — لا نص خارجه
 PROMPT;
+}
 
+/** Strip markdown code fence then parse JSON */
+function parseAIResponse(string $text): array
+{
+    $text = trim($text);
+    // Remove ```json ... ``` or ``` ... ```
+    $text = preg_replace('/^```(?:json)?\s*/i', '', $text);
+    $text = preg_replace('/\s*```$/s', '', $text);
+    $text = trim($text);
+
+    $parsed = json_decode($text, true);
+    if ($parsed !== null && isset($parsed['message'])) return $parsed;
+
+    // Attempt to extract a JSON object from inside a larger text
+    if (preg_match('/\{[\s\S]*"message"[\s\S]*\}/s', $text, $m)) {
+        $inner = json_decode($m[0], true);
+        if ($inner !== null && isset($inner['message'])) return $inner;
+    }
+
+    return ['message' => $text, 'files' => []];
+}
+
+function callGemini(string $apiKey, string $model, string $system, array $history, string $userMsg): array
+{
     $contents = [];
     foreach ($history as $msg) {
+        // Gemini uses 'model' role, not 'assistant'
         $contents[] = [
             'role'  => $msg['role'],
             'parts' => [['text' => $msg['content']]],
@@ -226,14 +241,14 @@ PROMPT;
         'system_instruction' => ['parts' => [['text' => $system]]],
         'contents'           => $contents,
         'generationConfig'   => [
-            'temperature'       => 0.7,
-            'maxOutputTokens'   => 8192,
-            'responseMimeType'  => 'application/json',
+            'temperature'      => 0.7,
+            'maxOutputTokens'  => 8192,
+            'responseMimeType' => 'application/json',
         ],
     ];
 
     $url = 'https://generativelanguage.googleapis.com/v1beta/models/'
-         . GEMINI_MODEL . ':generateContent?key=' . GEMINI_API_KEY;
+         . $model . ':generateContent?key=' . $apiKey;
 
     $ch = curl_init($url);
     curl_setopt_array($ch, [
@@ -250,26 +265,117 @@ PROMPT;
     $curlErr  = curl_error($ch);
     curl_close($ch);
 
-    if ($curlErr)        return ['error' => 'cURL: ' . $curlErr];
+    if ($curlErr) return ['error' => 'cURL: ' . $curlErr];
     if ($httpCode !== 200) {
         $err = json_decode($raw, true);
-        return ['error' => 'Gemini API: ' . ($err['error']['message'] ?? "HTTP $httpCode")];
+        return ['error' => 'Gemini: ' . ($err['error']['message'] ?? "HTTP $httpCode")];
     }
 
     $data = json_decode($raw, true);
     $text = $data['candidates'][0]['content']['parts'][0]['text'] ?? '';
-
     if (empty($text)) return ['error' => 'الرد من Gemini فارغ'];
 
-    // Strip possible markdown code fence
-    $text = preg_replace('/^```(?:json)?\s*/i', '', trim($text));
-    $text = preg_replace('/\s*```$/', '', $text);
+    return parseAIResponse($text);
+}
 
-    $parsed = json_decode($text, true);
-    if ($parsed !== null && isset($parsed['message'])) return $parsed;
+/** OpenAI-compatible: Groq, DeepSeek, OpenRouter */
+function callOpenAICompat(string $provider, string $apiKey, string $model, string $system, array $history, string $userMsg): array
+{
+    static $endpoints = [
+        'groq'       => 'https://api.groq.com/openai/v1/chat/completions',
+        'deepseek'   => 'https://api.deepseek.com/v1/chat/completions',
+        'openrouter' => 'https://openrouter.ai/api/v1/chat/completions',
+    ];
 
-    // Fallback: plain message
-    return ['message' => $text, 'files' => []];
+    $url = $endpoints[$provider] ?? '';
+    if (!$url) return ['error' => "URL غير معروف للمزود: $provider"];
+
+    $messages = [['role' => 'system', 'content' => $system]];
+    foreach ($history as $msg) {
+        $messages[] = [
+            'role'    => $msg['role'] === 'model' ? 'assistant' : 'user',
+            'content' => $msg['content'],
+        ];
+    }
+    $messages[] = ['role' => 'user', 'content' => $userMsg];
+
+    $body = [
+        'model'       => $model,
+        'messages'    => $messages,
+        'temperature' => 0.7,
+        'max_tokens'  => 8192,
+    ];
+
+    // JSON mode — supported by Groq & DeepSeek but not all OpenRouter models
+    if (in_array($provider, ['groq', 'deepseek'])) {
+        $body['response_format'] = ['type' => 'json_object'];
+    }
+
+    $headers = [
+        'Content-Type: application/json',
+        'Authorization: Bearer ' . $apiKey,
+    ];
+    if ($provider === 'openrouter') {
+        $headers[] = 'HTTP-Referer: https://ai-code-editor.local';
+        $headers[] = 'X-Title: AI Code Editor';
+    }
+
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => json_encode($body),
+        CURLOPT_HTTPHEADER     => $headers,
+        CURLOPT_TIMEOUT        => 120,
+        CURLOPT_SSL_VERIFYPEER => true,
+    ]);
+
+    $raw      = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlErr  = curl_error($ch);
+    curl_close($ch);
+
+    if ($curlErr) return ['error' => 'cURL: ' . $curlErr];
+
+    $data = json_decode($raw, true);
+    if ($httpCode !== 200) {
+        $errMsg = $data['error']['message'] ?? "HTTP $httpCode";
+        return ['error' => "$provider: $errMsg"];
+    }
+
+    $text = $data['choices'][0]['message']['content'] ?? '';
+    if (empty($text)) return ['error' => "الرد فارغ من $provider"];
+
+    return parseAIResponse($text);
+}
+
+/** Main dispatcher — routes to the correct provider function */
+function callAI(string $provider, string $model, string $projectName, string $ctx, array $history, string $userMsg): array
+{
+    $providers = AI_PROVIDERS;
+
+    if (!isset($providers[$provider])) {
+        return ['error' => "مزود غير معروف: $provider"];
+    }
+
+    $apiKey = $providers[$provider]['api_key'] ?? '';
+    if (empty($apiKey) || str_starts_with($apiKey, 'YOUR_')) {
+        return ['error' => "لم يتم إعداد API Key لـ {$providers[$provider]['name']} — افتح config.php وأضف مفتاحك"];
+    }
+
+    if (empty($model) || !isset($providers[$provider]['models'][$model])) {
+        // Default to first model in provider
+        $model = array_key_first($providers[$provider]['models']);
+    }
+
+    $system = buildSystemPrompt($projectName, $ctx);
+
+    return match ($provider) {
+        'gemini'                  => callGemini($apiKey, $model, $system, $history, $userMsg),
+        'groq', 'deepseek', 'openrouter'
+                                  => callOpenAICompat($provider, $apiKey, $model, $system, $history, $userMsg),
+        default                   => ['error' => "مزود غير مدعوم: $provider"],
+    };
 }
 
 // ─── Router ──────────────────────────────────────────────────────────────────
@@ -444,14 +550,31 @@ try {
             getDB()->prepare("DELETE FROM chat_history WHERE project_id = ?")->execute([$pid]);
             jsonOk(['success' => true]);
 
+        case 'list_models':
+            $result = [];
+            foreach (AI_PROVIDERS as $key => $p) {
+                $hasKey = !empty($p['api_key']) && !str_starts_with($p['api_key'], 'YOUR_');
+                $models = [];
+                foreach ($p['models'] as $mid => $info) {
+                    $models[] = ['id' => $mid, 'label' => $info['label'], 'free' => $info['free']];
+                }
+                $result[] = [
+                    'id'      => $key,
+                    'name'    => $p['name'],
+                    'has_key' => $hasKey,
+                    'models'  => $models,
+                ];
+            }
+            jsonOk(['providers' => $result]);
+
         case 'chat':
-            $pid = (int)($input['project_id'] ?? 0);
-            $msg = trim($input['message'] ?? '');
+            $pid      = (int)($input['project_id'] ?? 0);
+            $msg      = trim($input['message'] ?? '');
+            $provider = trim($input['provider'] ?? 'gemini');
+            $model    = trim($input['model']    ?? '');
 
             if (!$pid) jsonErr('project_id مطلوب');
             if ($msg === '') jsonErr('الرسالة لا يمكن أن تكون فارغة');
-            if (GEMINI_API_KEY === 'YOUR_GEMINI_API_KEY_HERE')
-                jsonErr('لم يتم إعداد Gemini API Key - افتح config.php وأضف مفتاحك');
 
             $db   = getDB();
             $stmt = $db->prepare("SELECT id, name FROM projects WHERE id = ?");
@@ -468,7 +591,7 @@ try {
             $history = array_reverse($stmt->fetchAll());
 
             $context  = buildContext($pid);
-            $response = callGemini($project['name'], $context, $history, $msg);
+            $response = callAI($provider, $model, $project['name'], $context, $history, $msg);
 
             if (isset($response['error'])) jsonErr($response['error'], 502);
 
@@ -516,6 +639,34 @@ try {
 
             getDB()->prepare("UPDATE projects SET updated_at=NOW() WHERE id=?")->execute([$pid]);
             jsonOk(['success' => true, 'results' => $results]);
+
+        case 'save_api_keys':
+            $keys    = $input['keys'] ?? [];
+            $allowed = array_keys(AI_PROVIDERS);
+
+            if (!is_array($keys) || empty($keys)) jsonErr('لا توجد مفاتيح للحفظ');
+
+            $configPath = __DIR__ . '/config.php';
+            $config     = file_get_contents($configPath);
+
+            foreach ($keys as $provider => $key) {
+                if (!in_array($provider, $allowed, true)) continue;
+                $key = preg_replace('/[^a-zA-Z0-9\-_.:\/ ]/', '', trim($key));
+                if (empty($key)) continue;
+
+                // Replace the existing placeholder in the config file
+                $config = preg_replace(
+                    "/('" . preg_quote($provider, '/') . "'\s*=>\s*\[[\s\S]*?'api_key'\s*=>\s*')[^']*(')/U",
+                    '${1}' . $key . '${2}',
+                    $config
+                );
+            }
+
+            if (file_put_contents($configPath, $config) === false) {
+                jsonErr('فشل الكتابة إلى config.php — تحقق من صلاحيات الملف', 500);
+            }
+
+            jsonOk(['success' => true]);
 
         default:
             jsonErr('إجراء غير معروف', 404);

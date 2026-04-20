@@ -14,12 +14,27 @@
   <header class="app-header">
     <span class="logo">⚡ AI Code Editor</span>
     <span class="project-title" id="project-title">اختر مشروعاً</span>
+
+    <!-- Model Selector -->
+    <div class="model-selector" id="model-selector" title="اختر نموذج الذكاء الاصطناعي">
+      <select id="sel-provider" title="المزود">
+        <option value="">جاري التحميل...</option>
+      </select>
+      <select id="sel-model" title="النموذج">
+        <option value="">—</option>
+      </select>
+      <span id="provider-status" class="provider-status"></span>
+    </div>
+
     <div class="header-actions">
+      <button id="btn-api-keys" class="btn btn-ghost btn-sm" title="إعداد مفاتيح API">
+        🔑 المفاتيح
+      </button>
       <a id="btn-export" class="btn btn-ghost btn-sm" download title="تصدير المشروع كـ ZIP">
-        📦 تصدير ZIP
+        📦 ZIP
       </a>
       <button id="btn-clear-chat" class="btn btn-ghost btn-sm" title="مسح سجل المحادثة">
-        🗑️ مسح المحادثة
+        🗑️ مسح
       </button>
     </div>
   </header>

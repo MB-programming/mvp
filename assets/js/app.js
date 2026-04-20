@@ -5,11 +5,17 @@
 // ─── State ────────────────────────────────────────────────────────────────
 const state = {
   projects:         [],
-  currentProject:   null,   // { id, name, description }
+  currentProject:   null,
   currentFilePath:  null,
   fileModified:     false,
   busy:             false,
-  pendingFiles:     [],     // files from AI waiting to be applied
+  pendingFiles:     [],
+  providers:        [],     // loaded from server
+  // selected provider/model persisted in localStorage
+  get provider()  { return localStorage.getItem('ai_provider')  || 'gemini'; },
+  set provider(v) { localStorage.setItem('ai_provider', v); },
+  get model()     { return localStorage.getItem('ai_model')     || ''; },
+  set model(v)    { localStorage.setItem('ai_model', v); },
 };
 
 // ─── API Helper ───────────────────────────────────────────────────────────
@@ -483,6 +489,8 @@ async function sendMessage() {
     const data = await api('chat', 'POST', {
       project_id: state.currentProject.id,
       message,
+      provider:   state.provider,
+      model:      state.model,
     });
 
     indicator.remove();
@@ -588,11 +596,155 @@ document.addEventListener('keydown', e => {
   }
 });
 
+// ─── Model Selector ──────────────────────────────────────────────────────
+async function loadModels() {
+  try {
+    const data = await fetch('api.php?action=list_models').then(r => r.json());
+    state.providers = data.providers || [];
+    renderProviderSelect();
+  } catch (e) {
+    console.warn('Failed to load models', e);
+  }
+}
+
+function renderProviderSelect() {
+  const selP = document.getElementById('sel-provider');
+  const selM = document.getElementById('sel-model');
+
+  selP.innerHTML = state.providers.map(p => {
+    const badge = p.has_key ? '✓' : '⚠';
+    return `<option value="${p.id}" ${p.id === state.provider ? 'selected' : ''}>${badge} ${p.name}</option>`;
+  }).join('');
+
+  updateModelSelect();
+
+  selP.addEventListener('change', () => {
+    state.provider = selP.value;
+    // Default to first model of new provider
+    const prov = state.providers.find(p => p.id === selP.value);
+    state.model = prov?.models[0]?.id || '';
+    updateModelSelect();
+    updateProviderStatus();
+  });
+
+  selM.addEventListener('change', () => {
+    state.model = selM.value;
+  });
+
+  updateProviderStatus();
+}
+
+function updateModelSelect() {
+  const selM  = document.getElementById('sel-model');
+  const prov  = state.providers.find(p => p.id === state.provider);
+  if (!prov) return;
+
+  selM.innerHTML = prov.models.map(m => {
+    const freeTag = m.free ? ' 🆓' : '';
+    return `<option value="${m.id}" ${m.id === state.model ? 'selected' : ''}>${m.label}${freeTag}</option>`;
+  }).join('');
+
+  // Sync state.model to whatever is selected
+  state.model = selM.value;
+}
+
+function updateProviderStatus() {
+  const status = document.getElementById('provider-status');
+  const prov   = state.providers.find(p => p.id === state.provider);
+  if (!prov) { status.textContent = ''; return; }
+  status.textContent = prov.has_key ? '🟢' : '🔴';
+  status.title       = prov.has_key
+    ? `${prov.name}: مفتاح API متوفر`
+    : `${prov.name}: يرجى إضافة API Key في config.php`;
+}
+
+// ─── API Keys Modal ───────────────────────────────────────────────────────
+function openApiKeysModal() {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+
+  const blocks = state.providers.map(p => {
+    const hasKey = p.has_key;
+    const icon   = hasKey ? '🟢' : '🔴';
+    const freeModels = p.models.filter(m => m.free).length;
+
+    return `
+      <div class="provider-block">
+        <div class="keys-provider-header">
+          <span>${icon} ${escHtml(p.name)}</span>
+          ${freeModels > 0 ? `<span class="free-badge">🆓 ${freeModels} نموذج مجاني</span>` : ''}
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;">
+          <input type="password" id="key_${p.id}"
+            placeholder="أدخل API Key لـ ${escHtml(p.name)}"
+            style="flex:1;background:var(--input-bg);border:1px solid var(--border);border-radius:4px;
+                   color:var(--text);font-family:var(--font-code);font-size:12px;padding:5px 8px;outline:none;"
+          >
+          <span style="font-size:12px;color:var(--text-dim);white-space:nowrap;">${hasKey ? '✓ محفوظ' : 'غير مضبوط'}</span>
+        </div>
+        <div style="font-size:11px;color:var(--text-dim);margin-top:4px;">
+          ${getProviderLink(p.id)}
+        </div>
+      </div>`;
+  }).join('');
+
+  overlay.innerHTML = `
+    <div class="modal" style="max-width:540px;">
+      <h3>🔑 إعداد مفاتيح API</h3>
+      <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px;">
+        أدخل مفتاح واحد على الأقل للبدء. المفاتيح تُحفظ في <code>config.php</code> على السيرفر.
+      </p>
+      ${blocks}
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="modal-cancel">إغلاق</button>
+        <button class="btn btn-primary" id="modal-save-keys">💾 حفظ المفاتيح</button>
+      </div>
+    </div>`;
+
+  document.body.appendChild(overlay);
+
+  overlay.querySelector('#modal-cancel').onclick = () => overlay.remove();
+  overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+
+  overlay.querySelector('#modal-save-keys').onclick = async () => {
+    const updates = {};
+    state.providers.forEach(p => {
+      const val = overlay.querySelector(`#key_${p.id}`)?.value.trim();
+      if (val) updates[p.id] = val;
+    });
+
+    if (!Object.keys(updates).length) {
+      toast('لم تُدخل أي مفتاح', 'error');
+      return;
+    }
+
+    try {
+      await api('save_api_keys', 'POST', { keys: updates });
+      toast('تم حفظ المفاتيح ✓ — جاري إعادة تحميل النماذج...');
+      overlay.remove();
+      await loadModels();
+    } catch (e) {
+      toast('فشل الحفظ: ' + e.message, 'error');
+    }
+  };
+}
+
+function getProviderLink(id) {
+  const links = {
+    gemini:      '<a href="https://aistudio.google.com/apikey" target="_blank" style="color:#4fc3f7;">احصل على مفتاح Gemini مجاناً ↗</a>',
+    groq:        '<a href="https://console.groq.com/keys" target="_blank" style="color:#4fc3f7;">احصل على مفتاح Groq مجاناً ↗</a>',
+    deepseek:    '<a href="https://platform.deepseek.com/api_keys" target="_blank" style="color:#4fc3f7;">احصل على مفتاح DeepSeek ↗</a>',
+    openrouter:  '<a href="https://openrouter.ai/keys" target="_blank" style="color:#4fc3f7;">احصل على مفتاح OpenRouter مجاناً ↗</a>',
+  };
+  return links[id] || '';
+}
+
 // ─── Init ─────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
   // Wire up static buttons
   document.getElementById('btn-new-project').addEventListener('click', promptNewProject);
   document.getElementById('btn-clear-chat').addEventListener('click', clearChat);
+  document.getElementById('btn-api-keys').addEventListener('click', openApiKeysModal);
   document.getElementById('btn-send').addEventListener('click', sendMessage);
   document.getElementById('btn-save-file').addEventListener('click', saveFile);
   document.getElementById('btn-new-file').addEventListener('click', promptNewFile);
@@ -624,4 +776,5 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   loadProjects();
+  loadModels();
 });
